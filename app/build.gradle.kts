@@ -65,6 +65,12 @@ android {
                 // Include x86_64 for emulator support during development
                 abiFilters += listOf("arm64-v8a", "x86_64", "armeabi-v7a", "x86")
             }
+            // Limit to a single ABI for sandbox builds when -Pbitchat.singleAbi=true.
+            // Reduces APK size and native-lib packaging time on memory-constrained machines.
+            if (providers.gradleProperty("bitchat.singleAbi").isPresent) {
+                ndk.abiFilters.clear()
+                ndk.abiFilters.add("arm64-v8a")
+            }
         }
         release {
             if (releaseUiTests) {
@@ -89,17 +95,23 @@ android {
     // AAB for Play Store handles architecture distribution automatically
     // Auto-detects: splits enabled for assemble tasks, disabled for bundle tasks
     // Works in Android Studio GUI and CLI without needing extra properties
-    val enableSplits = gradle.startParameter.taskNames.any { taskName ->
-        taskName.contains("assemble", ignoreCase = true) &&
-        !taskName.contains("bundle", ignoreCase = true)
-    }
+    //
+    // -Pbitchat.disableSplits=true forces a single universal APK, which reduces
+    // peak memory during DEX merge on constrained build hosts.
+    val enableSplits = !providers.gradleProperty("bitchat.disableSplits").isPresent &&
+        gradle.startParameter.taskNames.any { taskName ->
+            taskName.contains("assemble", ignoreCase = true) &&
+            !taskName.contains("bundle", ignoreCase = true)
+        }
 
     splits {
         abi {
             isEnable = enableSplits
-            reset()
-            include("arm64-v8a", "x86_64", "armeabi-v7a", "x86")
-            isUniversalApk = true  // For F-Droid and fallback
+            if (enableSplits) {
+                reset()
+                include("arm64-v8a", "x86_64", "armeabi-v7a", "x86")
+                isUniversalApk = true  // For F-Droid and fallback
+            }
         }
     }
 

@@ -794,6 +794,46 @@ class BluetoothMeshService(private val context: Context) : TransportBridgeServic
         }
     }
 
+    /**
+     * Public entry point for Bluetooth adapter state changes.
+     *
+     * Delegates to the [BluetoothConnectionManager], which will force a BLE scan restart
+     * (and re-arm advertising) when the adapter transitions to ON, or attempt to start the
+     * mesh services if they had previously failed because Bluetooth was off.
+     *
+     * Wired up by [com.bitchat.android.mesh.BluetoothStateReceiver], which is registered
+     * for [android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED] while the mesh is
+     * active. This is the public API used to "detect Bluetooth on/off state and force
+     * scan" - callers may also invoke it directly to simulate a toggle (e.g. from tests
+     * or a debug menu).
+     *
+     * @param state a [android.bluetooth.BluetoothAdapter] state constant.
+     */
+    fun onBluetoothAdapterStateChanged(state: Int) {
+        // Forward even when not active: the receiver will only fire while the connection
+        // manager is alive, but the connection manager may have set isActive=false (e.g.
+        // because BT was off when startServices() was called). The handler inside the
+        // connection manager decides whether to force-scan or re-attempt startServices().
+        try {
+            connectionManager.onBluetoothAdapterStateChanged(state)
+        } catch (e: Exception) {
+            Log.w(TAG, "onBluetoothAdapterStateChanged($state) failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Manually force a BLE scan restart. Exposed for debug UI / tests so the same recovery
+     * path that runs when Bluetooth is toggled on can be triggered without toggling the
+     * radio. No-op when the mesh is not active.
+     */
+    fun forceBluetoothScanRestart() {
+        try {
+            connectionManager.forceBluetoothScanRestart()
+        } catch (e: Exception) {
+            Log.w(TAG, "forceBluetoothScanRestart failed: ${e.message}")
+        }
+    }
+
     private fun pauseServicesForTransportDisable() {
         Log.i(TAG, "Disabling BLE mesh transport")
         isActive = false

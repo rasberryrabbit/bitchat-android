@@ -364,6 +364,36 @@ class BluetoothGattClientManager(
             }
         }
     }
+
+    /**
+     * Public entry point for an external trigger (e.g. BluetoothStateReceiver) to
+     * force a scan restart immediately after the Bluetooth adapter transitions to ON.
+     *
+     * The BLE stack drops all scanner state when the radio is toggled off and the
+     * previous scan callback is invalidated. Without this, bitchat would silently
+     * miss peers until the next watchdog cycle (up to 30s) or never recover if
+     * scanningDesired had been cleared.
+     *
+     * Safe to call from any thread; only schedules work on the connection scope.
+     */
+    fun forceScanRestart() {
+        Log.i(TAG, "forceScanRestart: triggered by external Bluetooth state change")
+        // Mark that we want to be scanning so the watchdog and duty-cycle scheduler
+        // do not immediately turn it back off again.
+        scanningDesired = true
+        // Re-apply the current power profile: this will re-start the duty cycle job
+        // (or continuous scan + watchdog) with a fresh state. This is the same path
+        // taken when the power mode changes, so we know it produces a clean start.
+        connectionScope.launch {
+            try {
+                applyPowerProfile(powerManager.profile.value)
+            } catch (e: Exception) {
+                Log.w(TAG, "forceScanRestart: applyPowerProfile failed: ${e.message}")
+                // Fall back to a direct restart.
+                forceRestartScan()
+            }
+        }
+    }
     
     /**
      * Handle scan result and initiate connection if appropriate

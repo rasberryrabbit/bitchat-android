@@ -2,7 +2,11 @@ package com.bitchat.android.mesh
 
 import android.bluetooth.*
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.bitchat.android.model.RoutedPacket
 import com.bitchat.android.protocol.BitchatPacket
 import kotlinx.coroutines.*
@@ -97,6 +101,18 @@ class BluetoothConnectionManager(
     
     // Delegate for callbacks
     var delegate: BluetoothConnectionManagerDelegate? = null
+
+    /**
+     * Dynamically-registered receiver that fires whenever the Bluetooth adapter is toggled
+     * off/on by the user or system. Used to force a scan restart when BT comes back on,
+     * because the BLE stack invalidates all scanner callbacks when the radio goes off.
+     *
+     * Null when not registered. Registration/unregistration happens synchronously from
+     * start/stop, and onReceive only forwards a single call to
+     * [onBluetoothAdapterStateChanged].
+     */
+    private var bluetoothStateReceiver: BluetoothStateReceiver? = null
+
     
     // Public property for address-peer mapping
     val addressPeerMap get() = connectionTracker.addressPeerMap
@@ -231,6 +247,12 @@ class BluetoothConnectionManager(
         
         if (bluetoothAdapter?.isEnabled != true) {
             Log.e(TAG, "Bluetooth is not enabled")
+            // Even though we can't start scanning right now, register the state receiver
+            // so that when the user turns Bluetooth on, we automatically (re)start services
+            // and force a scan. This is the core of the "detect BT on/off and force scan"
+            // feature: a mesh service that was started while the radio was off will still
+            // react to the radio coming back.
+            registerBluetoothStateReceiver()
             return false
         }
         
@@ -246,6 +268,10 @@ class BluetoothConnectionManager(
         // } catch (se: SecurityException) {
         //     Log.e(TAG, "Missing BLUETOOTH_CONNECT permission to set adapter name.", se)
         // }
+
+            // Register the BT state receiver so a later off->on toggle forces a scan restart.
+            // Registered here (rather than in init) so it only fires while the mesh is alive.
+            registerBluetoothStateReceiver()
 
             // Start all component managers
             connectionScope.launch {
@@ -292,11 +318,136 @@ class BluetoothConnectionManager(
     }
 
     /**
+     * Register [BluetoothStateReceiver] to listen for BluetoothAdapter.ACTION_STATE_CHANGED.
+     * Idempotent: calling it while a receiver is already registered is a no-op.
+     *
+     * On Android 13+ (API 33+) we must specify an export flag for dynamic receivers.
+     * ACTION_STATE_CHANGED is a system/protected broadcast, so we use RECEIVER_NOT_EXPORTED.
+     */
+    private fun registerBluetoothStateReceiver() {
+        if (bluetoothStateReceiver != null) {
+            Log.d(TAG, "BluetoothStateReceiver already registered; skipping")
+            return
+        }
+        val receiver = BluetoothStateReceiver { state ->
+            onBluetoothAdapterStateChanged(state)
+        }
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.registerReceiver(
+                    context,
+                    receiver,
+                    filter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED
+                )
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(receiver, filter)
+            }
+            bluetoothStateReceiver = receiver
+            Log.i(TAG, "BluetoothStateReceiver registered (will force-scan on BT ON)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register BluetoothStateReceiver: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Unregister [BluetoothStateReceiver] if previously registered. Safe to call from any
+     * state (including when never registered or already unregistered).
+     */
+    private fun unregisterBluetoothStateReceiver() {
+        val receiver = bluetoothStateReceiver ?: return
+        try {
+            context.unregisterReceiver(receiver)
+            Log.i(TAG, "BluetoothStateReceiver unregistered")
+        } catch (e: Exception) {
+            // Common when the receiver was already unregistered; not fatal.
+            Log.w(TAG, "Failed to unregister BluetoothStateReceiver: ${e.message}")
+        }
+        bluetoothStateReceiver = null
+    }
+
+    /**
+     * Public handler for Bluetooth adapter state changes.
+     *
+     * Called by [BluetoothStateReceiver] whenever the adapter transitions between OFF / ON
+     * (and the intermediate TURNING_* states). The most important transition is OFF -> ON:
+     * the BLE stack has just torn down all scanner callbacks and rebuilt the radio, so the
+     * client manager's "isCurrentlyScanning" flag is stale and the scanner is no longer
+     * running. We force a clean restart here so peer discovery resumes immediately instead
+     * of waiting for (or never getting) a watchdog recovery.
+     *
+     * Also exposes [forceBluetoothScanRestart] publicly for callers (debug UI, tests) that
+     * want to manually trigger the same recovery path.
+     *
+     * @param state the new [BluetoothAdapter] state (STATE_OFF, STATE_TURNING_OFF,
+     * STATE_ON, STATE_TURNING_ON, ...)
+     */
+    fun onBluetoothAdapterStateChanged(state: Int) {
+        when (state) {
+            BluetoothAdapter.STATE_ON -> {
+                Log.i(TAG, "Bluetooth adapter turned ON -> forcing BLE scan restart")
+                if (isActive) {
+                    // Re-arm advertising in case the server side was also wedged.
+                    if (isGattServerEnabled()) {
+                        try { serverManager.restartAdvertising() } catch (e: Exception) {
+                            Log.w(TAG, "restartAdvertising failed: ${e.message}")
+                        }
+                    }
+                    // The core fix: force the client scanner to restart now.
+                    if (isGattClientEnabled()) {
+                        try { clientManager.forceScanRestart() } catch (e: Exception) {
+                            Log.w(TAG, "forceScanRestart failed: ${e.message}")
+                        }
+                    }
+                } else {
+                    // The mesh service was started while BT was off (startServices() returned
+                    // false). Try again now that the adapter is on.
+                    Log.i(TAG, "Mesh inactive but BT just came on -> attempting startServices()")
+                    startServices()
+                }
+            }
+            BluetoothAdapter.STATE_TURNING_OFF -> {
+                Log.i(TAG, "Bluetooth adapter turning OFF -> scan will be stopped by system")
+                // System stops the scan for us; our flags will be corrected on the next
+                // STATE_ON by forceScanRestart(). Nothing to do here.
+            }
+            BluetoothAdapter.STATE_OFF -> {
+                Log.i(TAG, "Bluetooth adapter is OFF")
+            }
+            BluetoothAdapter.STATE_TURNING_ON -> {
+                Log.d(TAG, "Bluetooth adapter turning ON (waiting for STATE_ON to scan)")
+            }
+            else -> {
+                Log.d(TAG, "Bluetooth adapter state: $state")
+            }
+        }
+    }
+
+    /**
+     * Manually trigger a forced BLE scan restart. Exposed for debug UI / tests so the same
+     * recovery path used on BT ON can be invoked without actually toggling the radio.
+     */
+    fun forceBluetoothScanRestart() {
+        if (isActive && isGattClientEnabled()) {
+            Log.i(TAG, "Manual forceBluetoothScanRestart requested")
+            try { clientManager.forceScanRestart() } catch (e: Exception) {
+                Log.w(TAG, "Manual forceScanRestart failed: ${e.message}")
+            }
+        } else {
+            Log.w(TAG, "forceBluetoothScanRestart ignored: inactive or client disabled")
+        }
+    }
+
+
+    /**
      * Disable BLE without cancelling this manager's coroutine scope, so it can be re-enabled.
      */
     fun disableTransport() {
         Log.i(TAG, "Disabling BLE transport")
         isActive = false
+        unregisterBluetoothStateReceiver()
         connectionScope.launch {
             clientManager.stop()
             serverManager.stop()
@@ -309,6 +460,7 @@ class BluetoothConnectionManager(
      */
     fun stopServices() {
         isActive = false
+        unregisterBluetoothStateReceiver()
 
         connectionScope.launch {
             // Stop component managers
